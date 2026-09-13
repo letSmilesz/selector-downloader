@@ -1,19 +1,64 @@
 import os
-from random import random
 from pathlib import Path
 from typing import Optional, Tuple, List
+import json
+import shutil
 from playwright.sync_api import sync_playwright, BrowserContext, Page, Playwright
 from core.logger import debug_log, emit_event, get_app_base_dir
 
-# Пул современных User-Agent для ротации (Windows + Chrome)
-_UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-]
+def find_pinned_chrome() -> Optional[Path]:
+    """Ищет пинированный Chrome проекта. Возвращает путь или None."""
+    base = get_app_base_dir()
+    candidates = [
+        base / "chrome152" / "chrome.exe",
+        base / "chrome152" / "chrome-win64" / "chrome.exe",
+        base / "chrome_bin" / "chrome.exe",
+        base / "chrome_bin" / "chrome-win64" / "chrome.exe",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+def normalize_profile_prefs(profile_dir: Path) -> None:
+    """Убивает воскресение вкладок: сносит файлы-списки сессии и сбрасывает
+    «краш»-статус профиля. Куки, localStorage и sessionStorage НЕ трогает.
+    Вызывать ТОЛЬКО когда Chrome не запущен."""
+    default_dir = profile_dir / "Default"
+    # 1) Физически удаляем списки вкладок для восстановления
+    victims: List[Path] = []
+    sess_dir = default_dir / "Sessions"
+    if sess_dir.is_dir():
+        victims.extend(sess_dir.iterdir())
+    for name in ("Current Session", "Current Tabs", "Last Session", "Last Tabs"):
+        victims.append(default_dir / name)
+    for v in victims:
+        try:
+            if v.is_file():
+                v.unlink()
+            elif v.is_dir():
+                shutil.rmtree(v, ignore_errors=True)
+        except Exception:
+            pass
+    # 2) Preferences: нет «краша», старт = чистая новая вкладка
+    prefs_path = default_dir / "Preferences"
+    if not prefs_path.exists():
+        return
+    try:
+        data = json.loads(prefs_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    changed = False
+    prof = data.setdefault("profile", {})
+    if prof.get("exit_type") != "Normal":
+        prof["exit_type"] = "Normal"
+        changed = True
+    sess = data.setdefault("session", {})
+    if sess.get("restore_on_startup") != 5:   # 5 = всегда чистая новая вкладка
+        sess["restore_on_startup"] = 5
+        changed = True
+    if changed:
+        prefs_path.write_text(json.dumps(data), encoding="utf-8")
 
 class BrowserSession:
     def __init__(self,
@@ -22,14 +67,15 @@ class BrowserSession:
                  profile_dir: Optional[Path] = None,
                  viewport: Tuple[int, int] = (1200, 800),
                  same_site_fix: bool = False,
-                 extra_args: Optional[List[str]] = None):
+                 extra_args: Optional[List[str]] = None,
+                 executable_path: Optional[str] = None):
         self.headed = headed
         self.channel = channel
         self.profile_dir = profile_dir or (get_app_base_dir() / "chrome_profile")
         self.viewport = viewport
         self.same_site_fix = same_site_fix
         self.extra_args = extra_args or []
-        
+        self.executable_path = executable_path
         self._playwright: Optional[Playwright] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
@@ -55,12 +101,14 @@ class BrowserSession:
         except FileExistsError:
             raise RuntimeError(f"Не удалось создать lock-файл {self._lock_path}")
         self._lock_held = True
-
+        normalize_profile_prefs(self.profile_dir) 
         args = [
             "--profile-directory=Default",
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
+            "--hide-restore-bubble",
+            "--disable-session-crashed-bubble",
         ]
         if not self.headed:
             args.append("--ignore-certificate-errors")
@@ -70,52 +118,32 @@ class BrowserSession:
 
         try:
             self._playwright = sync_playwright().start()
+            
+            # Выбираем бинарь: явно заданный > пинированный в проекте
+            # Системный Chrome ЗАПРЕЩЁН — только пинированный бинарь
+            exe = Path(self.executable_path) if self.executable_path else find_pinned_chrome()
+            
+            if not exe:
+                raise RuntimeError(
+                    "Пинированный Chrome не найден. "
+                    "Запустите 'python scripts/setup_chrome.py' для установки или "
+                    "укажите путь через executable_path."
+                )
+            
+            debug_log(f"BrowserSession: используется пинированный бинарь {exe}")
             self._context = self._playwright.chromium.launch_persistent_context(
                 user_data_dir=str(self.profile_dir),
                 headless=not self.headed,
-                channel=self.channel,
+                executable_path=str(exe),  # channel и executable_path взаимоисключающи
                 viewport={"width": self.viewport[0], "height": self.viewport[1]},
                 args=args,
-                # Ротация User-Agent из пула, чтобы не палиться на Linux-серверах
-                user_agent=_UA_POOL[int(random() * len(_UA_POOL))],
             )
-            
-            # Антидетект: скрываем признаки автоматизации до загрузки страниц
-            self._context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [
-                        { name: "Chrome PDF Plugin", filename: "internal-pdf-viewer", description: "Portable Document Format" },
-                        { name: "Chrome PDF Viewer", filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai", description: "" },
-                        { name: "Native Client", filename: "internal-nacl-plugin", description: "" }
-                    ]
-                });
-                Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
-                
-                const getParameter = WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                    if (parameter === 37445) return 'Intel Inc.'; 
-                    if (parameter === 37446) return 'Intel(R) Iris(Xe) Graphics';
-                    return getParameter.apply(this, arguments);
-                };
-            """)
-            
             self._context.set_default_timeout(30000)
             self._context.set_default_navigation_timeout(30000)
-
             if self._context.pages:
                 self._page = self._context.pages[0]
             else:
                 self._page = self._context.new_page()
-            def _on_new_page(p):
-                try:
-                    if p is not self._page:
-                        p.close()
-                        debug_log("driver: закрыта рекламная вкладка")
-                except Exception:
-                    pass
-            self._context.on("page", _on_new_page)
-                
             debug_log(f"BrowserSession started (headed={self.headed}, channel={self.channel})")
             emit_event("browser_started", headed=self.headed, channel=self.channel)
         except Exception as e:
@@ -156,6 +184,13 @@ class BrowserSession:
 
     def goto(self, url: str, timeout_ms: int = 30000, referer: str = "https://www.google.com/") -> None:
         self.page.goto(url, timeout=timeout_ms, referer=referer, wait_until='domcontentloaded')
+
+    def add_init_script(self, script: str) -> None:
+        """Регистрирует init-скрипт контекста (применяется до загрузки страниц).
+        Используется только auth-режимом для маршрутизации попапов в текущую вкладку."""
+        if self._context is None:
+            raise RuntimeError("Браузер не запущен. Вызовите start() сначала.")
+        self._context.add_init_script(script)
 
     def __enter__(self):
         self.start()
