@@ -1,0 +1,4 @@
+# Браузерная автоматизация (используется системный Google Chrome, channel="chrome")
+playwright
+# GUI (API Flet 0.80+: ft.Button, page.services)
+flet>=0.80
