@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 import json
 import shutil
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, BrowserContext, Page, Playwright
 from core.logger import debug_log, emit_event, get_app_base_dir
 
@@ -183,7 +184,44 @@ class BrowserSession:
         return self._page
 
     def goto(self, url: str, timeout_ms: int = 30000, referer: str = "https://www.google.com/") -> None:
-        self.page.goto(url, timeout=timeout_ms, referer=referer, wait_until='domcontentloaded')
+        resp = self.page.goto(url, timeout=timeout_ms, referer=referer, wait_until='domcontentloaded')
+        status = resp.status if resp is not None else 0
+        debug_log(f"goto: статус {status} для {url}")
+        if (status in (403, 404)
+                and urlparse(url).scheme in ("http", "https")
+                and urlparse(referer).scheme in ("http", "https")):
+            debug_log(f"goto: статус {status} — похоже на защиту от прямого захода, ретрай через живой реферер")
+            if not self._goto_cross_site(url, referer, timeout_ms):
+                # Возвращаем состояние «как раньше»: страница на исходном URL
+                self.page.goto(url, timeout=timeout_ms, referer=referer, wait_until='domcontentloaded')
+
+    def _goto_cross_site(self, url: str, referer_page: str, timeout_ms: int) -> bool:
+        """Заход на сайты с anti-hotlink защитой (404 при прямом goto).
+        Садимся на документ-донор реферера и уходим с него доверенным кликом:
+        Chromium сам строит пакет cross-site перехода (Referer по политике
+        донора + Sec-Fetch-Site: cross-site, Sec-Fetch-Mode: navigate,
+        Sec-Fetch-Dest: document, Sec-Fetch-User: ?1). Фолбэк — location.replace."""
+        try:
+            self.page.goto(referer_page, timeout=timeout_ms, wait_until="domcontentloaded")
+            stay = self.page.url
+            try:
+                self.page.evaluate(
+                    "u => { const a = document.createElement('a'); a.href = u; a.id = '__xsite';"
+                    " a.textContent = 'goto'; a.style.cssText = 'position:fixed;top:0;left:0;z-index:2147483647';"
+                    " document.body.appendChild(a); }",
+                    url,
+                )
+                self.page.click("#__xsite", timeout=5000)
+            except Exception as e:
+                debug_log(f"_goto_cross_site: клик по внедрённой ссылке не удался ({e}) — location.replace")
+                self.page.evaluate("u => { window.location.replace(u); }", url)
+            self.page.wait_for_url(lambda u: u != stay, timeout=timeout_ms)
+            self.page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+            debug_log(f"_goto_cross_site: заход через живой реферер выполнен, url={self.page.url}")
+            return True
+        except Exception as e:
+            debug_log(f"_goto_cross_site: не удалось: {e}")
+            return False    
 
     def add_init_script(self, script: str) -> None:
         """Регистрирует init-скрипт контекста (применяется до загрузки страниц).
