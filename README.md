@@ -22,13 +22,20 @@ Primary platform: Windows.
 ## Requirements
 
 - Python 3.10+
-- Google Chrome
+- Pinned Chrome for Testing (installed once via `scripts/setup_chrome.py`)
 - Dependencies: `pip install playwright flet` (Flet 0.80+)
 
 ## Running
 
 ```
-# GUI
+# First setup (one-time)
+python scripts/setup_chrome.py
+
+# GUI (Windows double-click)
+run_gui.vbs   # silent mode, no console window
+run_gui.bat   # console mode, errors visible
+
+# GUI (manual)
 python frontend/main_window.py
 
 # CLI
@@ -128,7 +135,9 @@ A "Read from the beginning" button works too: downloading starts at chapter 1 an
    - "Could not extract chapter number" → preset regexes;
    - chapter downloaded empty → `image_selector`;
    - placeholders instead of pages → `banned_paths`; for sites with referer-protected
-     images start from the title URL, not "chapter by link".
+      images start from the title URL, not "chapter by link".
+      Some sites return 404 on direct navigation — the downloader automatically retries
+      via referer fallback (visible in debug log as `goto: статус 404...` + `_goto_cross_site...`).
 
 ## Advanced: where things live
 
@@ -145,6 +154,9 @@ A "Read from the beginning" button works too: downloading starts at chapter 1 an
 | `core/` | log + events, preset manager, file naming, delays, defaults |
 | `output/archiver.py`, `output/epub.py` | CBZ and EPUB building |
 | `scripts/gui_auth.py` | login browser |
+| `scripts/setup_chrome.py` | installs pinned Chrome for Testing 152|
+| `scripts/pw_test.py`| developer mode: browser under Playwright for preset debugging |
+| `run_gui.bat` / `run_gui.vbs` | Windows GUI launchers (console / silent) |
 | `presets/*.json` | site presets |
 | `downloads/` | output (default) |
 | `chrome_profile/` | persistent browser profile. **Contains your cookies — never publish.** |

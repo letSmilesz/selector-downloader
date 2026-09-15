@@ -22,13 +22,20 @@ Google Chrome (Playwright) с вашим постоянным профилем: 
 ## Требования
 
 - Python 3.10+
-- Google Chrome
+- Пинированный Chrome for Testing (устанавливается одноразово через `scripts/setup_chrome.py`)
 - Зависимости: `pip install playwright flet` (Flet 0.80+)
 
 ## Запуск
 
 ```
-# GUI
+# Первичная настройка (одноразово)
+python scripts/setup_chrome.py
+
+# GUI (двойной клик на Windows)
+run_gui.vbs   # тихий режим, без консольного окна
+run_gui.bat   # консольный режим, видны ошибки
+
+# GUI (вручную)
 python frontend/main_window.py
 
 # CLI
@@ -128,6 +135,8 @@ python main.py "<URL тайтла или главы>" --mode web
    - глава скачалась пустой → `image_selector`;
    - заглушки вместо страниц → `banned_paths`; для сайтов с referer-защитой
      картинок запускайте с URL тайтла, а не «глава по ссылке».
+     Некоторые сайты отдают 404 на прямой заход — загрузчик автоматически повторяет
+     попытку через реферер-фолбэк (видно в debug-логе как `goto: статус 404...` + `_goto_cross_site...`).
 
 ## Advanced: что где лежит
 
@@ -144,6 +153,9 @@ python main.py "<URL тайтла или главы>" --mode web
 | `core/` | лог + события, менеджер пресетов, имена файлов, задержки, дефолты |
 | `output/archiver.py`, `output/epub.py` | сборка CBZ и EPUB |
 | `scripts/gui_auth.py` | браузер логина |
+| `scripts/setup_chrome.py` | устанавливает пинированный Chrome for Testing 152 |
+| `scripts/pw_test.py` | режим разработчика: браузер под Playwright для отладки пресетов |
+| `run_gui.bat` / `run_gui.vbs` | лаунчеры GUI для Windows (консольный / тихий) |
 | `presets/*.json` | пресеты сайтов |
 | `downloads/` | результат (по умолчанию) |
 | `chrome_profile/` | постоянный профиль браузера. **Содержит ваши куки — не публикуйте.** |
