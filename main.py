@@ -90,7 +90,7 @@ def main():
         print("2. Открой любую главу, переключи режим на нужный")
         print("3. Вернись сюда и нажми ENTER")
         print(f"{'='*64}\n")
-        with BrowserSession(headed=True, channel=args.channel) as session:
+        with BrowserSession(headed=True, channel=args.channel, initial_url=args.url) as session:
             session.goto(args.url)
             input("Нажми ENTER после подготовки...")
         print("✅ Профиль подготовлен.")
@@ -133,7 +133,8 @@ def main():
     clean_failed_temps = not args.keep_failed_temps
 
     # --- Запуск браузера ---
-    with BrowserSession(headed=args.headed, channel=args.channel) as session:
+    with BrowserSession(headed=args.headed, channel=args.channel,
+                        initial_url=args.url) as session:
         interceptor = ImageInterceptor(session.page)
         interceptor.attach()
         

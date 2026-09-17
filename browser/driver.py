@@ -3,6 +3,9 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 import json
 import shutil
+import socket
+import subprocess
+import time
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, BrowserContext, Page, Playwright
 from core.logger import debug_log, emit_event, get_app_base_dir
@@ -69,7 +72,8 @@ class BrowserSession:
                  viewport: Tuple[int, int] = (1200, 800),
                  same_site_fix: bool = False,
                  extra_args: Optional[List[str]] = None,
-                 executable_path: Optional[str] = None):
+                 executable_path: Optional[str] = None,
+                 initial_url: Optional[str] = None):
         self.headed = headed
         self.channel = channel
         self.profile_dir = profile_dir or (get_app_base_dir() / "chrome_profile")
@@ -77,74 +81,97 @@ class BrowserSession:
         self.same_site_fix = same_site_fix
         self.extra_args = extra_args or []
         self.executable_path = executable_path
+        self.initial_url = initial_url
+        self._browser_proc: Optional[subprocess.Popen] = None
         self._playwright: Optional[Playwright] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._lock_path = self.profile_dir / ".downloader.lock"
         self._lock_held = False
 
+    def _free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def _wait_port(self, port: int, timeout_s: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    return True
+            except OSError:
+                time.sleep(0.25)
+        return False
+
     def start(self) -> None:
-        """Запускает браузер с постоянным профилем."""
+        """Запускает браузер с постоянным профилем: свой spawn чистой cmdline
+        (класс gui_auth/Т2) + connect_over_cdp. Стартовая навигация браузера несёт
+        куки; launch_persistent_context не используется (Т1: при CDP с рождения
+        куки не шлёт ни одна навигация)."""
         if self._context is not None:
             return
-            
         if self._lock_path.exists():
             raise RuntimeError(
                 f"Профиль занят другим процессом (файл {self._lock_path}). "
                 "Если это не так, удалите файл вручную."
             )
-            
         self.profile_dir.mkdir(parents=True, exist_ok=True)
-        
         try:
             with open(self._lock_path, 'x') as f:
                 f.write(str(os.getpid()))
         except FileExistsError:
             raise RuntimeError(f"Не удалось создать lock-файл {self._lock_path}")
         self._lock_held = True
-        normalize_profile_prefs(self.profile_dir) 
-        args = [
-            "--profile-directory=Default",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-            "--hide-restore-bubble",
-            "--disable-session-crashed-bubble",
-        ]
-        if not self.headed:
-            args.append("--ignore-certificate-errors")
-        if self.same_site_fix:
-            args.append("--disable-features=SameSiteByDefaultCookies,CookiesWithoutSameSiteMustBeSecure")
-        args.extend(self.extra_args)
-
+        normalize_profile_prefs(self.profile_dir)
         try:
-            self._playwright = sync_playwright().start()
-            
-            # Выбираем бинарь: явно заданный > пинированный в проекте
-            # Системный Chrome ЗАПРЕЩЁН — только пинированный бинарь
             exe = Path(self.executable_path) if self.executable_path else find_pinned_chrome()
-            
             if not exe:
                 raise RuntimeError(
                     "Пинированный Chrome не найден. "
                     "Запустите 'python scripts/setup_chrome.py' для установки или "
                     "укажите путь через executable_path."
                 )
-            
             debug_log(f"BrowserSession: используется пинированный бинарь {exe}")
-            self._context = self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self.profile_dir),
-                headless=not self.headed,
-                executable_path=str(exe),  # channel и executable_path взаимоисключающи
-                viewport={"width": self.viewport[0], "height": self.viewport[1]},
-                args=args,
-            )
+            port = self._free_port()
+            args = [
+                f"--user-data-dir={self.profile_dir}",
+                "--profile-directory=Default",
+                "--hide-restore-bubble",
+                "--disable-session-crashed-bubble",
+                f"--remote-debugging-port={port}",
+            ]
+            if not self.headed:
+                args += ["--headless=new", "--ignore-certificate-errors"]
+            if self.same_site_fix:
+                args.append("--disable-features=SameSiteByDefaultCookies,CookiesWithoutSameSiteMustBeSecure")
+            args.extend(self.extra_args)
+            args.append(self.initial_url or "about:blank")
+            self._browser_proc = subprocess.Popen([str(exe)] + args)
+            if not self._wait_port(port):
+                raise RuntimeError("Chrome не открыл отладочный порт за 20 секунд")
+            self._playwright = sync_playwright().start()
+            browser = self._playwright.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{port}", timeout=30000)
+            if not browser.contexts:
+                raise RuntimeError("connect_over_cdp не вернул ни одного контекста")
+            self._context = browser.contexts[0]
             self._context.set_default_timeout(30000)
             self._context.set_default_navigation_timeout(30000)
             if self._context.pages:
                 self._page = self._context.pages[0]
             else:
                 self._page = self._context.new_page()
+            try:
+                self._page.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception as e:
+                debug_log(f"BrowserSession: ожидание стартовой загрузки: {e}")
+            if self.headed:
+                try:
+                    self._page.set_viewport_size(
+                        {"width": self.viewport[0], "height": self.viewport[1]})
+                except Exception as e:
+                    debug_log(f"BrowserSession: viewport не применён: {e}")
             debug_log(f"BrowserSession started (headed={self.headed}, channel={self.channel})")
             emit_event("browser_started", headed=self.headed, channel=self.channel)
         except Exception as e:
@@ -153,21 +180,30 @@ class BrowserSession:
             raise
 
     def close(self) -> None:
-        """Закрывает браузер и освобождает профиль."""
-        if self._context:
-            try:
-                self._context.close()
-            except Exception as e:
-                debug_log(f"Ошибка при закрытии контекста: {e}")
-            self._context = None
-            self._page = None
+        """Отключает Playwright и штатно (WM_CLOSE) гасит Chrome — порядок
+        «сначала pw off, затем браузер» проверен вручную: jar сохраняется."""
         if self._playwright:
             try:
                 self._playwright.stop()
             except Exception as e:
                 debug_log(f"Ошибка при остановке Playwright: {e}")
             self._playwright = None
-        # Удаляем lock-файл
+        self._context = None
+        self._page = None
+        if self._browser_proc is not None:
+            pid = self._browser_proc.pid
+            try:
+                subprocess.run(["taskkill", "/PID", str(pid)],
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self._browser_proc.wait(timeout=10)
+            except Exception:
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    self._browser_proc.wait(timeout=5)
+                except Exception as e:
+                    debug_log(f"Не удалось завершить Chrome: {e}")
+            self._browser_proc = None
         if self._lock_held:
             try:
                 if self._lock_path.exists():
@@ -184,6 +220,11 @@ class BrowserSession:
         return self._page
 
     def goto(self, url: str, timeout_ms: int = 30000, referer: str = "https://www.google.com/") -> None:
+        cur, tgt = urlparse(self.page.url), urlparse(url)
+        if (cur.scheme, cur.netloc, cur.path) == (tgt.scheme, tgt.netloc, tgt.path):
+            debug_log(f"goto: уже на этом URL ({url}) — навигация пропущена "
+                      "(CDP-навигации не шлют куки, стартовая уже выполнена)")
+            return
         resp = self.page.goto(url, timeout=timeout_ms, referer=referer, wait_until='domcontentloaded')
         status = resp.status if resp is not None else 0
         debug_log(f"goto: статус {status} для {url}")
