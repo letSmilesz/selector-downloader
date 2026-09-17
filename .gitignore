@@ -21,3 +21,4 @@ logs/
 .ignore
 git*
 3.0
+_dev_artifacts
