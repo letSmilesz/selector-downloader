@@ -221,20 +221,35 @@ class BrowserSession:
 
     def goto(self, url: str, timeout_ms: int = 30000, referer: str = "https://www.google.com/") -> None:
         cur, tgt = urlparse(self.page.url), urlparse(url)
-        if (cur.scheme, cur.netloc, cur.path) == (tgt.scheme, tgt.netloc, tgt.path):
-            debug_log(f"goto: уже на этом URL ({url}) — навигация пропущена "
-                      "(CDP-навигации не шлют куки, стартовая уже выполнена)")
-            return
-        resp = self.page.goto(url, timeout=timeout_ms, referer=referer, wait_until='domcontentloaded')
-        status = resp.status if resp is not None else 0
-        debug_log(f"goto: статус {status} для {url}")
+        same = (cur.scheme, cur.netloc, cur.path) == (tgt.scheme, tgt.netloc, tgt.path)
+        if same:
+            # Страницу уже открыла стартовая навигация браузера (с куками профиля).
+            # Её статус берём из PerformanceNavigationTiming: anti-hotlink сайты
+            # (ahen и т.п.) отдают 403/404 на прямой заход без реферера.
+            try:
+                status = self.page.evaluate(
+                    "() => { const e = performance.getEntriesByType('navigation')[0];"
+                    " return e && 'responseStatus' in e ? e.responseStatus : 0; }")
+            except Exception as e:
+                debug_log(f"goto: не удалось прочитать статус стартовой навигации: {e}")
+                status = 0
+            debug_log(f"goto: уже на этом URL ({url}) — статус стартовой навигации {status}")
+            if status not in (403, 404):
+                return
+        else:
+            resp = self.page.goto(url, timeout=timeout_ms, referer=referer, wait_until='domcontentloaded')
+            status = resp.status if resp is not None else 0
+            debug_log(f"goto: статус {status} для {url}")
         if (status in (403, 404)
                 and urlparse(url).scheme in ("http", "https")
                 and urlparse(referer).scheme in ("http", "https")):
             debug_log(f"goto: статус {status} — похоже на защиту от прямого захода, ретрай через живой реферер")
             if not self._goto_cross_site(url, referer, timeout_ms):
-                # Возвращаем состояние «как раньше»: страница на исходном URL
-                self.page.goto(url, timeout=timeout_ms, referer=referer, wait_until='domcontentloaded')
+                if not same:
+                    # Возвращаем состояние «как раньше»: страница на исходном URL
+                    self.page.goto(url, timeout=timeout_ms, referer=referer, wait_until='domcontentloaded')
+                else:
+                    debug_log("goto: ретрай через живой реферер не удался, остаёмся на стартовой странице")
 
     def _goto_cross_site(self, url: str, referer_page: str, timeout_ms: int) -> bool:
         """Заход на сайты с anti-hotlink защитой (404 при прямом goto).
@@ -243,8 +258,10 @@ class BrowserSession:
         донора + Sec-Fetch-Site: cross-site, Sec-Fetch-Mode: navigate,
         Sec-Fetch-Dest: document, Sec-Fetch-User: ?1). Фолбэк — location.replace."""
         try:
+            t0 = time.monotonic()
             self.page.goto(referer_page, timeout=timeout_ms, wait_until="domcontentloaded")
             stay = self.page.url
+            debug_log(f"_goto_cross_site: донор загружен за {time.monotonic() - t0:.1f}с: {stay}")
             try:
                 self.page.evaluate(
                     "u => { const a = document.createElement('a'); a.href = u; a.id = '__xsite';"
@@ -257,12 +274,20 @@ class BrowserSession:
                 debug_log(f"_goto_cross_site: клик по внедрённой ссылке не удался ({e}) — location.replace")
                 self.page.evaluate("u => { window.location.replace(u); }", url)
             self.page.wait_for_url(lambda u: u != stay, timeout=timeout_ms)
-            self.page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-            debug_log(f"_goto_cross_site: заход через живой реферер выполнен, url={self.page.url}")
+            debug_log(f"_goto_cross_site: переход выполнен за {time.monotonic() - t0:.1f}с, url={self.page.url}")
+            # Best-effort: цепочки челленжей (DDoS-Guard) устраивают гонку жизненного
+            # цикла — Playwright может прозевать уже случившийся domcontentloaded
+            # и ложно висеть до таймаута. URL уже на цели: селекторы дальше дождутся DOM сами.
+            try:
+                self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                debug_log("_goto_cross_site: ожидание domcontentloaded вышло по таймауту "
+                          "(цепочка челленжей) — продолжаем, URL уже на цели")
+            debug_log(f"_goto_cross_site: заход через живой реферер выполнен за {time.monotonic() - t0:.1f}с, url={self.page.url}")
             return True
         except Exception as e:
-            debug_log(f"_goto_cross_site: не удалось: {e}")
-            return False    
+            debug_log(f"_goto_cross_site: не удалось за {time.monotonic() - t0:.1f}с: {e}")
+            return False  
 
     def add_init_script(self, script: str) -> None:
         """Регистрирует init-скрипт контекста (применяется до загрузки страниц).
