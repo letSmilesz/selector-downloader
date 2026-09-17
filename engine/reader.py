@@ -103,6 +103,10 @@ def dismiss_popups(page: Page, preset: dict) -> None:
                 for idx in range(min(loc.count(), 10)):
                     el = loc.nth(idx)
                     if el.is_visible():
+                        try:
+                            el.scroll_into_view_if_needed(timeout=1000)
+                        except Exception:
+                            pass
                         el.click(timeout=1500)
                         debug_log(f"dismiss_popups: кликнут {css} (совпадение {idx})")
                         clicked_any = True
@@ -129,6 +133,10 @@ def dismiss_popups(page: Page, preset: dict) -> None:
                 for idx in range(min(loc.count(), 3)):
                     el = loc.nth(idx)
                     if el.is_visible():
+                        try:
+                            el.scroll_into_view_if_needed(timeout=1000)
+                        except Exception:
+                            pass
                         el.click(timeout=1500)
                         debug_log(f"dismiss_popups: кликнут стандартный крестик {sel}")
                         time.sleep(0.3)
@@ -717,6 +725,7 @@ def ensure_mode(page: Page, preset: dict, mode: str) -> None:
         time.sleep(1.0)
     except Exception as e:
         debug_log(f"ensure_mode: reload не удался: {e}")
+    post_nav_checks(page, preset)
 
 def extract_chapter_meta(page: Page, preset: dict, url: str) -> dict:
     meta = preset.get("meta", {})
@@ -1104,6 +1113,10 @@ def _warm_via_own_link(page: Page, preset: dict) -> bool:
             try:
                 if not el.is_visible():
                     continue
+                try:
+                    el.scroll_into_view_if_needed(timeout=1000)
+                except Exception:
+                    pass
                 el.click(timeout=3000)
                 page.wait_for_load_state("domcontentloaded", timeout=15000)
                 debug_log(f"_warm_via_own_link: перезашли через ссылку оглавления ({href})")
@@ -1570,6 +1583,10 @@ def goto_next_chapter(page: Page, preset: dict) -> Optional[str]:
             continue
         for attempt in range(2):
             try:
+                try:
+                    loc.first.scroll_into_view_if_needed(timeout=1000)
+                except Exception:
+                    pass
                 loc.first.click(timeout=3000)
             except Exception as e:
                 debug_log(f"goto_next_chapter: клик не удался ({sel}): {e}")

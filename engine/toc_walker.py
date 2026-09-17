@@ -61,7 +61,12 @@ def ensure_toc(page: Page, preset: dict) -> None:
     # Вкладки «Главы» нет, но есть кнопка возврата — мы на странице главы, идём на тайтл
     if back_sel and not (toc_link and locate(page, toc_link).count() > 0):
         try:
-            locate(page, back_sel).first.click(timeout=5000)
+            back_btn = locate(page, back_sel).first
+            try:
+                back_btn.scroll_into_view_if_needed(timeout=1000)
+            except Exception:
+                pass
+            back_btn.click(timeout=5000)
             debug_log("ensure_toc: клик по back_to_toc_btn (возврат на тайтл)")
             time.sleep(1.5)
         except Exception as e:
@@ -73,6 +78,10 @@ def ensure_toc(page: Page, preset: dict) -> None:
         try:
             tab = locate(page, toc_link).first
             if tab.count() > 0 and tab.is_visible():
+                try:
+                    tab.scroll_into_view_if_needed(timeout=1000)
+                except Exception:
+                    pass
                 tab.click(timeout=5000)
                 debug_log("ensure_toc: клик по toc_link (вкладка Главы)")
                 for _ in range(10):
